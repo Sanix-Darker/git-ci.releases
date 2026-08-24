@@ -87,6 +87,10 @@ done
 
 [ -z "$repo_url" ] || [ "$service_install" -eq 1 ] || die '--repo requires --service'
 [ -z "$domain" ] || [ "$service_install" -eq 1 ] || die '--domain requires --service'
+if [ -n "${GCI_LICENSE_KEY:-}" ]; then
+	case "$GCI_LICENSE_KEY" in *'
+'*) die 'GCI_LICENSE_KEY must not contain a newline' ;; esac
+fi
 
 case "$domain" in
 	'' ) ;;
@@ -282,7 +286,8 @@ EOF
 		destination=$projects_root/$repo_name
 		[ ! -e "$destination" ] || die "repository destination already exists: $destination"
 		if [ "$(id -u)" -eq 0 ]; then
-			su -s /bin/sh "$service_user" -c "git clone -- '$repo_url' '$destination'"
+			command -v runuser >/dev/null 2>&1 || die 'runuser is required to clone as the service account'
+			runuser -u "$service_user" -- git clone -- "$repo_url" "$destination"
 		else
 			sudo -u "$service_user" git clone -- "$repo_url" "$destination"
 		fi
