@@ -10,6 +10,7 @@ service_install=0
 with_docker=0
 upgrade=0
 repo_url=''
+project_path=''
 domain=''
 listen_port=''
 install_dir=${GCI_INSTALL_DIR:-}
@@ -29,6 +30,7 @@ Usage: install.sh [options]
   --system            Install /usr/local/bin/gci (requires root or sudo)
   --service           Install and start the systemd service; implies --system
   --repo URL          Clone one Git repository below /srv/projects after service setup
+  --project PATH      Register an existing Git project below /srv/projects
   --with-docker       Explicitly install/enable the OS Docker package
   --domain DOMAIN     Add a Caddy reverse-proxy route when Caddy is already installed
   --port PORT         Service origin port (default: first available from 8087)
@@ -65,6 +67,11 @@ while [ "$#" -gt 0 ]; do
 			repo_url=$2
 			shift 2
 			;;
+		--project)
+			[ "$#" -ge 2 ] || die '--project needs a value'
+			project_path=$2
+			shift 2
+			;;
 		--domain)
 			[ "$#" -ge 2 ] || die '--domain needs a value'
 			domain=$2
@@ -86,6 +93,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -z "$repo_url" ] || [ "$service_install" -eq 1 ] || die '--repo requires --service'
+[ -z "$project_path" ] || [ "$service_install" -eq 1 ] || die '--project requires --service'
+[ -z "$repo_url" ] || [ -z "$project_path" ] || die 'use either --repo or --project, not both'
 [ -z "$domain" ] || [ "$service_install" -eq 1 ] || die '--domain requires --service'
 if [ -n "${GCI_LICENSE_KEY:-}" ]; then
 	case "$GCI_LICENSE_KEY" in *'
@@ -284,7 +293,7 @@ EOF
 		repo_name=${repo_name%.git}
 		case "$repo_name" in ''|*[!A-Za-z0-9._-]*) die 'repository name is unsafe' ;; esac
 		destination=$projects_root/$repo_name
-		[ ! -e "$destination" ] || die "repository destination already exists: $destination"
+		as_root test ! -e "$destination" || die "repository destination already exists: $destination"
 		if [ "$(id -u)" -eq 0 ]; then
 			command -v runuser >/dev/null 2>&1 || die 'runuser is required to clone as the service account'
 			runuser -u "$service_user" -- git clone -- "$repo_url" "$destination"
@@ -292,6 +301,47 @@ EOF
 			sudo -u "$service_user" git clone -- "$repo_url" "$destination"
 		fi
 		info "cloned repository at $destination"
+		project_path=$destination
+	fi
+
+	if [ -n "$project_path" ]; then
+		case "$projects_root" in
+			/*) ;;
+			*) die 'projects root must be an absolute path' ;;
+		esac
+		case "$project_path" in
+			"$projects_root"/*) ;;
+			*) die "project must be below $projects_root" ;;
+		esac
+		case "$project_path" in *[!A-Za-z0-9._/-]*) die 'project path contains unsupported characters' ;; esac
+		as_root test -d "$project_path/.git" || die "project is not a Git checkout: $project_path"
+		project_slug=${project_path##*/}
+		case "$project_slug" in ''|*[!A-Za-z0-9._-]*) die 'project slug is unsafe' ;; esac
+		token_file=$state_dir/admin.token
+		attempt=0
+		while ! curl -A "$user_agent" -fsS "http://127.0.0.1:$listen_port/health" >/dev/null 2>&1; do
+			attempt=$((attempt + 1))
+			[ "$attempt" -lt 30 ] || die 'GCI service did not become healthy'
+			sleep 1
+		done
+		as_root test -r "$token_file" || die "service token is unavailable: $token_file"
+		admin_token=$(as_root cat "$token_file")
+		case "$admin_token" in ''|*[!A-Za-z0-9._~-]*) die 'service token contains unsupported characters' ;; esac
+		curl_config=$temporary/curl-auth.conf
+		printf 'header = "Authorization: Bearer %s"\n' "$admin_token" >"$curl_config"
+		chmod 0600 "$curl_config"
+		project_request=$temporary/project.json
+		printf '{"slug":"%s","path":"%s"}\n' "$project_slug" "$project_path" >"$project_request"
+		project_response=$temporary/project-response.json
+		project_status=$(curl -A "$user_agent" -sS --config "$curl_config" \
+			-H 'Content-Type: application/json' -o "$project_response" -w '%{http_code}' \
+			-X POST --data-binary "@$project_request" "http://127.0.0.1:$listen_port/api/v1/projects")
+		case "$project_status" in
+			200|201) info "registered project $project_slug" ;;
+			409) info "project $project_slug is already registered" ;;
+			*) die "project registration failed with HTTP $project_status" ;;
+		esac
+		admin_token=''
 	fi
 
 	if [ -n "$domain" ]; then
