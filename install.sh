@@ -1,44 +1,37 @@
 #!/bin/sh
+# GCI installer v2: download, verify, install, then exec `gci up` with every
+# other argument. All setup (service, user, Docker, runner, Caddy) is in gci up.
 set -eu
 
 repository='Sanix-Darker/git-ci.releases'
 release_base=${GCI_RELEASE_BASE_URL:-https://github.com/$repository/releases/download}
 latest_url=${GCI_LATEST_URL:-https://github.com/$repository/releases/latest}
 version=''
-system_install=0
-service_install=0
-with_docker=0
-upgrade=0
-repo_url=''
-project_path=''
-domain=''
-listen_port=''
 install_dir=${GCI_INSTALL_DIR:-}
-state_dir=${GCI_STATE_DIR:-/var/lib/git-ci}
-projects_root=${GCI_PROJECTS_ROOT:-/srv/projects}
-service_user=${GCI_SERVICE_USER:-git-ci}
-user_agent='OpenAI File Downloader, XaiImageApiFetch/1.0'
+no_up=0
+user_agent=${GCI_INSTALL_USER_AGENT:-}
 
 usage() {
 	cat <<'EOF'
-Install GCI from the public checksummed release repository.
+Install GCI from the public checksummed release repository, then run gci up.
 
-Usage: install.sh [options]
+Usage: install.sh [--version V] [--install-dir D] [--no-up] [gci up arguments...]
 
-  --version VERSION   Install an exact release, for example v0.47.6
-  --upgrade           Replace an existing binary with the selected/latest release
-  --system            Install /usr/local/bin/gci (requires root or sudo)
-  --service           Install and start the systemd service; implies --system
-  --repo URL          Clone one Git repository below /srv/projects after service setup
-  --project PATH      Register an existing Git project below /srv/projects
-  --with-docker       Explicitly install/enable the OS Docker package
-  --domain DOMAIN     Add a Caddy reverse-proxy route when Caddy is already installed
-  --port PORT         Service origin port (default: first available from 8087)
-  --install-dir DIR   Override the user or system binary directory
+  --version VERSION   Install an exact release, for example v0.70.0 (default: latest)
+  --install-dir DIR   Binary directory (default: /usr/local/bin as root, else ~/.local/bin)
+  --no-up             Install the binary only
   -h, --help          Show this help
 
-License keys are accepted only through GCI_LICENSE_KEY or a later hidden prompt.
-They are never accepted as command arguments.
+Every other argument goes to `gci up`, for example:
+  install.sh https://gitlab.com glrt-XXXXXXXX
+  install.sh --project /srv/projects/app --domain ci.example.com
+
+Accepted for compatibility: --system, --service, --upgrade, --with-docker
+(no-ops: gci up decides) and --port P (passed on as --listen 127.0.0.1:P).
+A license key is read only from the GCI_LICENSE_KEY environment variable.
+Downloads say User-Agent: gci-installer/<version>; GCI_INSTALL_USER_AGENT
+replaces it for a network that needs another value.
+The installer never prompts.
 EOF
 }
 
@@ -51,66 +44,38 @@ info() {
 	printf 'gci install: %s\n' "$*"
 }
 
-while [ "$#" -gt 0 ]; do
-	case "$1" in
-		--version)
-			[ "$#" -ge 2 ] || die '--version needs a value'
-			version=$2
-			shift 2
+# Own flags are consumed; everything else is re-appended to "$@" for gci up.
+n=$#
+while [ "$n" -gt 0 ]; do
+	arg=$1
+	shift
+	n=$((n - 1))
+	case "$arg" in
+		--version|--install-dir|--port)
+			[ "$n" -gt 0 ] || die "$arg needs a value"
+			value=$1
+			shift
+			n=$((n - 1))
+			case "$arg" in
+				--version) version=$value ;;
+				--install-dir) install_dir=$value ;;
+				--port)
+					case "$value" in ''|*[!0-9]*) die 'port must be numeric' ;; esac
+					set -- "$@" --listen "127.0.0.1:$value"
+					;;
+			esac
 			;;
-		--upgrade) upgrade=1; shift ;;
-		--system) system_install=1; shift ;;
-		--service) service_install=1; system_install=1; shift ;;
-		--with-docker) with_docker=1; shift ;;
-		--repo)
-			[ "$#" -ge 2 ] || die '--repo needs a value'
-			repo_url=$2
-			shift 2
-			;;
-		--project)
-			[ "$#" -ge 2 ] || die '--project needs a value'
-			project_path=$2
-			shift 2
-			;;
-		--domain)
-			[ "$#" -ge 2 ] || die '--domain needs a value'
-			domain=$2
-			shift 2
-			;;
-		--port)
-			[ "$#" -ge 2 ] || die '--port needs a value'
-			listen_port=$2
-			shift 2
-			;;
-		--install-dir)
-			[ "$#" -ge 2 ] || die '--install-dir needs a value'
-			install_dir=$2
-			shift 2
-			;;
+		--no-up) no_up=1 ;;
+		--system|--service|--upgrade) info "$arg is no longer needed (gci up decides); ignored" ;;
+		--with-docker) info '--with-docker is automatic when installing as root; ignored' ;;
 		-h|--help) usage; exit 0 ;;
-		*) die "unknown argument: $1" ;;
+		*) set -- "$@" "$arg" ;;
 	esac
 done
 
-[ -z "$repo_url" ] || [ "$service_install" -eq 1 ] || die '--repo requires --service'
-[ -z "$project_path" ] || [ "$service_install" -eq 1 ] || die '--project requires --service'
-[ -z "$repo_url" ] || [ -z "$project_path" ] || die 'use either --repo or --project, not both'
-[ -z "$domain" ] || [ "$service_install" -eq 1 ] || die '--domain requires --service'
 if [ -n "${GCI_LICENSE_KEY:-}" ]; then
 	case "$GCI_LICENSE_KEY" in *'
 '*) die 'GCI_LICENSE_KEY must not contain a newline' ;; esac
-fi
-
-case "$domain" in
-	'' ) ;;
-	*[!A-Za-z0-9.-]*|.*|*.) die 'domain is invalid' ;;
-esac
-case "$listen_port" in
-	'' ) ;;
-	*[!0-9]*) die 'port must be numeric' ;;
-esac
-if [ -n "$listen_port" ] && { [ "$listen_port" -lt 1024 ] || [ "$listen_port" -gt 65535 ]; }; then
-	die 'port must be between 1024 and 65535'
 fi
 
 command -v curl >/dev/null 2>&1 || die 'curl is required'
@@ -124,7 +89,6 @@ case "$machine" in
 	aarch64|arm64) arch=arm64 ;;
 	*) die "unsupported architecture: $machine" ;;
 esac
-[ "$service_install" -eq 0 ] || [ "$os" = linux ] || die '--service supports Linux only'
 
 download() {
 	source_url=$1
@@ -141,12 +105,13 @@ if [ -z "$version" ]; then
 	if [ -n "${GCI_LATEST_VERSION:-}" ]; then
 		version=$GCI_LATEST_VERSION
 	else
-		effective=$(curl -A "$user_agent" -fsSLI --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$latest_url")
+		effective=$(curl -A "${user_agent:-gci-installer/latest}" -fsSLI --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$latest_url")
 		version=${effective##*/}
 	fi
 fi
 case "$version" in v[0-9]*.[0-9]*.[0-9]*) ;; *) die "invalid release version: $version" ;; esac
 case "$version" in *[!A-Za-z0-9._-]*) die "invalid release version: $version" ;; esac
+[ -n "$user_agent" ] || user_agent="gci-installer/$version"
 
 asset="gci-$version-$os-$arch.tar.gz"
 binary="gci-$os-$arch"
@@ -175,191 +140,26 @@ tar -xzf "$temporary/$asset" -C "$temporary"
 [ -f "$temporary/$binary" ] || die "archive does not contain $binary"
 chmod 0755 "$temporary/$binary"
 
-as_root() {
-	if [ "$(id -u)" -eq 0 ]; then
-		"$@"
-	elif command -v sudo >/dev/null 2>&1; then
-		sudo "$@"
-	else
-		die 'root privileges are required; install sudo or run as root'
-	fi
-}
-
 if [ -z "$install_dir" ]; then
-	if [ "$system_install" -eq 1 ]; then install_dir=/usr/local/bin; else install_dir=$HOME/.local/bin; fi
+	if [ "$(id -u)" -eq 0 ]; then install_dir=/usr/local/bin; else install_dir=$HOME/.local/bin; fi
 fi
-if [ "$system_install" -eq 1 ]; then
-	as_root install -d -m 0755 "$install_dir"
-	as_root install -m 0755 "$temporary/$binary" "$install_dir/.gci.new"
-	as_root mv -f "$install_dir/.gci.new" "$install_dir/gci"
-else
-	install -d -m 0755 "$install_dir"
-	install -m 0755 "$temporary/$binary" "$install_dir/.gci.new"
-	mv -f "$install_dir/.gci.new" "$install_dir/gci"
-fi
+install -d -m 0755 "$install_dir"
+install -m 0755 "$temporary/$binary" "$install_dir/.gci.new"
+mv -f "$install_dir/.gci.new" "$install_dir/gci"
 info "installed $version at $install_dir/gci"
-[ "$upgrade" -eq 0 ] || info 'upgrade completed'
 
-if [ "$with_docker" -eq 1 ]; then
-	[ "$os" = linux ] || die '--with-docker supports Linux only'
-	if ! command -v docker >/dev/null 2>&1; then
-		if command -v apt-get >/dev/null 2>&1; then
-			as_root apt-get update
-			as_root apt-get install -y docker.io
-		elif command -v dnf >/dev/null 2>&1; then
-			as_root dnf install -y docker
-		elif command -v yum >/dev/null 2>&1; then
-			as_root yum install -y docker
-		else
-			die 'no supported package manager found for Docker installation'
-		fi
-	fi
-	as_root systemctl enable --now docker
-	info 'Docker is installed and enabled'
+if [ "$no_up" -eq 1 ]; then
+	# Without gci up, say here what gci up's summary says otherwise (E4).
+	case ":${PATH:-}:" in
+		*":$install_dir:"*) ;;
+		*)
+			shown=$install_dir
+			[ "$install_dir" != "$HOME/.local/bin" ] || shown='$HOME/.local/bin'
+			info "$install_dir is not on PATH: this shell runs it as $install_dir/gci; to shorten it, add to your shell profile: export PATH=\"$shown:\$PATH\""
+			;;
+	esac
+	exit 0
 fi
-
-port_in_use() {
-	port=$1
-	if command -v ss >/dev/null 2>&1; then
-		ss -ltn | awk '{print $4}' | awk -F: -v port="$port" '$NF == port { found=1 } END { exit !found }'
-	elif command -v netstat >/dev/null 2>&1; then
-		netstat -ltn | awk '{print $4}' | awk -F: -v port="$port" '$NF == port { found=1 } END { exit !found }'
-	else
-		return 1
-	fi
-}
-
-if [ "$service_install" -eq 1 ]; then
-	command -v systemctl >/dev/null 2>&1 || die 'systemd is required for --service'
-	if [ -z "$listen_port" ]; then
-		listen_port=8087
-		while port_in_use "$listen_port"; do
-			listen_port=$((listen_port + 1))
-			[ "$listen_port" -le 8187 ] || die 'no available service port found between 8087 and 8187'
-		done
-	elif port_in_use "$listen_port"; then
-		die "port $listen_port is already in use"
-	fi
-
-	if ! id "$service_user" >/dev/null 2>&1; then
-		as_root useradd --system --home-dir "$state_dir" --create-home --shell /usr/sbin/nologin "$service_user"
-	fi
-	as_root install -d -m 0750 -o "$service_user" -g "$service_user" "$state_dir" "$projects_root"
-	as_root install -d -m 0750 /etc/git-ci
-	env_file=$temporary/git-ci.env
-	cat >"$env_file" <<EOF
-GIT_CI_LISTEN=127.0.0.1:$listen_port
-GIT_CI_STATE_DIR=$state_dir
-GIT_CI_PROJECTS_ROOT=$projects_root
-EOF
-	if [ -n "${GCI_LICENSE_KEY:-}" ]; then
-		printf 'GCI_LICENSE_KEY=%s\n' "$GCI_LICENSE_KEY" >>"$env_file"
-	fi
-	as_root install -m 0600 -o root -g "$service_user" "$env_file" /etc/git-ci/git-ci.env
-	unit_file=$temporary/git-ci.service
-	cat >"$unit_file" <<EOF
-[Unit]
-Description=GCI private CI/CD service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$service_user
-Group=$service_user
-EnvironmentFile=/etc/git-ci/git-ci.env
-ExecStart=$install_dir/gci serve --listen \${GIT_CI_LISTEN} --state-dir \${GIT_CI_STATE_DIR} --projects-root \${GIT_CI_PROJECTS_ROOT}
-Restart=on-failure
-RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=read-only
-UMask=0027
-
-[Install]
-WantedBy=multi-user.target
-EOF
-	as_root install -m 0644 "$unit_file" /etc/systemd/system/git-ci.service
-	if [ "$with_docker" -eq 1 ] && getent group docker >/dev/null 2>&1; then
-		as_root usermod -aG docker "$service_user"
-	fi
-	as_root systemctl daemon-reload
-	as_root systemctl enable --now git-ci.service
-	info "service is running at 127.0.0.1:$listen_port"
-
-	if [ -n "$repo_url" ]; then
-		command -v git >/dev/null 2>&1 || die 'git is required for --repo'
-		repo_name=${repo_url##*/}
-		repo_name=${repo_name%.git}
-		case "$repo_name" in ''|*[!A-Za-z0-9._-]*) die 'repository name is unsafe' ;; esac
-		destination=$projects_root/$repo_name
-		as_root test ! -e "$destination" || die "repository destination already exists: $destination"
-		if [ "$(id -u)" -eq 0 ]; then
-			command -v runuser >/dev/null 2>&1 || die 'runuser is required to clone as the service account'
-			runuser -u "$service_user" -- git clone -- "$repo_url" "$destination"
-		else
-			sudo -u "$service_user" git clone -- "$repo_url" "$destination"
-		fi
-		info "cloned repository at $destination"
-		project_path=$destination
-	fi
-
-	if [ -n "$project_path" ]; then
-		case "$projects_root" in
-			/*) ;;
-			*) die 'projects root must be an absolute path' ;;
-		esac
-		case "$project_path" in
-			"$projects_root"/*) ;;
-			*) die "project must be below $projects_root" ;;
-		esac
-		case "$project_path" in *[!A-Za-z0-9._/-]*) die 'project path contains unsupported characters' ;; esac
-		as_root test -d "$project_path/.git" || die "project is not a Git checkout: $project_path"
-		project_slug=${project_path##*/}
-		case "$project_slug" in ''|*[!A-Za-z0-9._-]*) die 'project slug is unsafe' ;; esac
-		token_file=$state_dir/admin.token
-		attempt=0
-		while ! curl -A "$user_agent" -fsS "http://127.0.0.1:$listen_port/health" >/dev/null 2>&1; do
-			attempt=$((attempt + 1))
-			[ "$attempt" -lt 30 ] || die 'GCI service did not become healthy'
-			sleep 1
-		done
-		as_root test -r "$token_file" || die "service token is unavailable: $token_file"
-		admin_token=$(as_root cat "$token_file")
-		case "$admin_token" in ''|*[!A-Za-z0-9._~-]*) die 'service token contains unsupported characters' ;; esac
-		curl_config=$temporary/curl-auth.conf
-		printf 'header = "Authorization: Bearer %s"\n' "$admin_token" >"$curl_config"
-		chmod 0600 "$curl_config"
-		project_request=$temporary/project.json
-		printf '{"slug":"%s","path":"%s"}\n' "$project_slug" "$project_path" >"$project_request"
-		project_response=$temporary/project-response.json
-		project_status=$(curl -A "$user_agent" -sS --config "$curl_config" \
-			-H 'Content-Type: application/json' -o "$project_response" -w '%{http_code}' \
-			-X POST --data-binary "@$project_request" "http://127.0.0.1:$listen_port/api/v1/projects")
-		case "$project_status" in
-			200|201) info "registered project $project_slug" ;;
-			409) info "project $project_slug is already registered" ;;
-			*) die "project registration failed with HTTP $project_status" ;;
-		esac
-		admin_token=''
-	fi
-
-	if [ -n "$domain" ]; then
-		command -v caddy >/dev/null 2>&1 || die '--domain requires an existing Caddy installation'
-		caddy_snippet=$temporary/gci.caddy
-		cat >"$caddy_snippet" <<EOF
-$domain {
-	reverse_proxy 127.0.0.1:$listen_port
-}
-EOF
-		as_root install -m 0644 "$caddy_snippet" /etc/caddy/gci.caddy
-		if ! as_root sh -c "grep -Fqx 'import /etc/caddy/gci.caddy' /etc/caddy/Caddyfile"; then
-			as_root sh -c "printf '\nimport /etc/caddy/gci.caddy\n' >> /etc/caddy/Caddyfile"
-		fi
-	as_root caddy validate --config /etc/caddy/Caddyfile
-		as_root systemctl reload caddy
-		info "Caddy route configured for https://$domain"
-	fi
-fi
-
-case ":$PATH:" in *":$install_dir:"*) ;; *) info "add $install_dir to PATH" ;; esac
+cleanup
+trap - EXIT HUP INT TERM
+exec "$install_dir/gci" up "$@"
