@@ -81,8 +81,7 @@ fi
 command -v curl >/dev/null 2>&1 || die 'curl is required'
 command -v tar >/dev/null 2>&1 || die 'tar is required'
 
-os=$(uname -s | tr '[:upper:]' '[:lower:]')
-case "$os" in linux|darwin) ;; *) die "unsupported operating system: $os" ;; esac
+case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) die "unsupported operating system: $(uname -s)" ;; esac
 machine=$(uname -m)
 case "$machine" in
 	x86_64|amd64) arch=amd64 ;;
